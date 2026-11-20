@@ -1,0 +1,67 @@
+name: CRCR receiver rehearsal
+run-name: CRCR rehearsal / ${{ github.event_name }} / ${{ inputs.pytorch_sha || github.event.client_payload.delivery_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pytorch_sha:
+        description: Full 40-character commit SHA from pytorch/pytorch
+        type: string
+        required: true
+  repository_dispatch:
+    types: [pull_request, push]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the fork of pytorch/crcr-test
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate dispatch and select the PyTorch revision
+        id: dispatch
+        shell: bash
+        env:
+          REHEARSAL_SHA: ${{ inputs.pytorch_sha }}
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/crcr-payload.json"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            jq --arg sha "$REHEARSAL_SHA" '
+              .payload.pull_request.head.sha = $sha |
+              .payload.pull_request.head.repo.full_name = "pytorch/pytorch"
+            ' tests/fixtures/pull_request_opened.json > "$payload"
+          else
+            jq -e '.client_payload' "$GITHUB_EVENT_PATH" > "$payload"
+          fi
+          python3 tests/validate_dispatch_payload.py < "$payload"
+          if jq -e '.payload | (.action == "closed" or .deleted == true)' "$payload" > /dev/null; then
+            echo "Validated close or deletion event. No revision to test in this rehearsal." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          jq -r '"sha=" + (.payload.pull_request.head.sha // .payload.after)' "$payload" >> "$GITHUB_OUTPUT"
+
+      - name: Check out only the PyTorch README at the requested revision
+        if: steps.dispatch.outputs.sha != ''
+        uses: actions/checkout@v4
+        with:
+          repository: pytorch/pytorch
+          ref: ${{ steps.dispatch.outputs.sha }}
+          path: pytorch
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Compare checkout HEAD with the event payload
+        if: steps.dispatch.outputs.sha != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/validate_pytorch_checkout.py --payload "$RUNNER_TEMP/crcr-payload.json" --pytorch-dir pytorch
+          sha=$(git -C pytorch rev-parse HEAD)
+          printf 'Verified PyTorch commit `%s` via `%s`.\n' "$sha" "$GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
